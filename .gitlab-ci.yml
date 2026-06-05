@@ -1,0 +1,146 @@
+variables:
+  GIT_DEPTH: "0"
+
+stages:
+  - test
+  - sync
+  - deploy
+
+# 1. ЭТАП: Синхронизация кода на GitHub с фильтрацией файлов
+sync_to_github:
+  stage: sync
+  image: bitnami/git:latest
+  script:
+    # 1. Удаляем историю коммитов GitLab раннера
+    - rm -rf .git
+
+    # 2. Удаляем файлы и папки, которые НЕ должны попасть на GitHub
+    # Файлы удаляются только в памяти раннера, в GitLab они останутся!
+    - rm -f install.txt
+    - rm -f .env.testing
+    - rm -f .env
+    - rm -rf папка_которую_нужно_скрыть/
+
+    # 3. Инициализируем чистый Git-репозиторий с нуля
+    - git init
+    - git config --global user.email "gitlab-ci@pet-project.online"
+    - git config --global user.name "GitLab CI"
+
+    # 4. Индексируем оставшиеся файлы и создаем ОДИН коммит
+    - git add .
+    - git commit -m "code"
+    - git branch -M master
+
+    # 5. Очищаем токен и отправляем код в GitHub
+    - CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '\r' | tr -d '\n' | xargs)
+    - git remote add github "https://oauth2:${CLEAN_TOKEN}@github.com/gromr007/holds.git"
+    - git push --force github master
+  only:
+    - master
+
+# 2. ЭТАП: Запуск тестов в изолированном контейнере
+run_tests:
+  stage: test
+  image: php:8.4-cli
+  services:
+    - name: mysql:8.0
+      alias: mysql
+  variables:
+    MYSQL_DATABASE: laraholds_testing
+    MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+
+  # ИСПОЛЬЗУЕМ ЭТОТ ПРАВИЛЬНЫЙ BEFORE_SCRIPT
+  before_script:
+    - apt-get update && apt-get install -y libzip-dev git unzip libpng-dev curl
+    - docker-php-ext-install zip pdo_mysql
+    # Устанавливаем глобально в /usr/bin/, чтобы команда точно была доступн
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/bin --filename=composer
+
+
+  script:
+    - cp .env.testing .env
+    - sed -i 's/DB_PASSWORD=.*/DB_PASSWORD=/' .env
+    - composer install --no-interaction --prefer-dist
+    - php artisan key:generate
+    - php artisan migrate --force
+    - php ./vendor/bin/phpunit
+  only:
+    - master
+
+
+
+# 3. ЭТАП: Деплой на VDS и выполнение консольных команд Laravel
+deploy_to_vds:
+  stage: deploy
+  image: alpine:latest
+  script:
+    - apk add --no-cache openssh-client rsync
+    # Исправление: Гарантируем перенос строки в конце ключа, чтобы libcrypto не ругался
+    - sed -i '$a\' $VDS_SSH_PRIVATE_KEY
+    # Задаем безопасные права доступа для ключа
+    - chmod 400 $VDS_SSH_PRIVATE_KEY
+
+    # 1. СТОП: Подключаемся на VDS и тушим все сервисы через ваш Makefile до обновления файлов
+    - >
+      ssh -i $VDS_SSH_PRIVATE_KEY -o StrictHostKeyChecking=no root@$VDS_HOST "
+      cd /home/projects/compose/www/ && make all-stop
+      "
+    #2. Подключаемся по SSH и создаем папку проекта, если её ещё нет
+    - ssh -i $VDS_SSH_PRIVATE_KEY -o StrictHostKeyChecking=no root@$VDS_HOST "mkdir -p /home/projects/compose/www/holds/"
+
+    # 3. Отправляем файлы на VDS через rsync (без удаления vendor и логов на сервере)
+    - rsync -atv --delete --exclude='.git/' --exclude='.env' --exclude='storage/*.key' --exclude='vendor/' --exclude='node_modules/' --exclude='storage/logs/' --exclude='bootstrap/cache/' --exclude='/database/database.sqlite' --exclude='storage/app/public/' -e "ssh -i $VDS_SSH_PRIVATE_KEY -o StrictHostKeyChecking=no" ./ root@$VDS_HOST:/home/projects/compose/www/holds/
+
+    # 4
+    # 4.1. Установка зависимостей (если composer.json изменился)
+    # 4.2. Полный сброс кэшей
+    # 4.3. Накатывание миграций базы данных (без подтверждения)
+    # 4.4. Включение кэширования для продакшена (конфиги, роуты, вьюхи)
+    - >
+      ssh -i "$VDS_SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no root@$VDS_HOST "
+      cd /home/projects/compose/www/holds/ &&
+      docker exec vds_php84 bash -c \"
+        cd holds &&
+        mkdir -p bootstrap/cache &&
+        chmod -R 775 bootstrap/cache &&
+        mkdir -p database &&
+        touch database/database.sqlite &&
+        composer install --no-dev --no-interaction &&
+        php artisan config:clear &&
+        php artisan migrate:fresh --force --seed &&
+        php artisan optimize:clear &&
+        php artisan optimize &&
+        php artisan view:cache
+        \"
+      "
+
+    # 5 Инициализация гит репозитория
+    - >
+      ssh -i "$VDS_SSH_PRIVATE_KEY" -o StrictHostKeyChecking=no root@$VDS_HOST "
+      chown -R 1000:1000 /home/projects/compose/www/holds/database &&
+      chmod 755 /home/projects/compose/www/holds/database &&
+      chmod 644 /home/projects/compose/www/holds/database/database.sqlite &&
+      cd /home/projects/compose/www/holds/ &&
+      rm -rf .git &&
+      git init &&
+      git config user.email 'vds@vds.ru' &&
+      git config user.name 'Vds' &&
+      git add -A &&
+      git commit -m 'start' &&
+      git branch -M vds
+      "
+
+    #5. Рестарт сервиса: Подключаемся на VDS Переходим к Makefile и перезапускаем PHP-FPM
+    - >
+      ssh -i $VDS_SSH_PRIVATE_KEY -o StrictHostKeyChecking=no root@$VDS_HOST "
+      cd /home/projects/compose/stacks/sites && docker compose up -d --force-recreate php84
+      "
+
+    #6. Старт: Подключаемся на VDS Переходим к Makefile и запускаем всё окружение (Очереди) на новом коде
+    - >
+      ssh -i $VDS_SSH_PRIVATE_KEY -o StrictHostKeyChecking=no root@$VDS_HOST "
+      cd /home/projects/compose/www/ && make all-start
+      "
+
+  only:
+    - master

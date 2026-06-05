@@ -1,0 +1,300 @@
+{
+    "openapi": "3.0.0",
+    "info": {
+        "title": "Booking Slots & Holds API",
+        "version": "1.0.0",
+        "description": "API высоконагруженной системы бронирования слотов с поддержкой идемпотентности и защиты от гонок условий."
+    },
+    "servers": [
+        {
+            "url": "/api",
+            "description": "Локальный сервер разработки"
+        }
+    ],
+    "tags": [
+        {
+            "name": "Слоты",
+            "description": "Операции со слотами и просмотр доступности мест"
+        },
+        {
+            "name": "Холды",
+            "description": "Управление временными удержаниями мест (создание, подтверждение, отмена)"
+        }
+    ],
+    "paths": {
+        "/slots/availability": {
+            "get": {
+                "tags": ["Слоты"],
+                "summary": "Получить список доступных слотов",
+                "description": "Возвращает актуальный список слотов. Запрос защищен от Cache Stampede с помощью Spinlock.",
+                "responses": {
+                    "200": {
+                        "description": "Успешный ответ со списком слотов",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": "#/components/schemas/SlotResource"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/slots/{slot_id}/holds": {
+            "post": {
+                "tags": ["Холды"],
+                "summary": "Создать временный холд на слот",
+                "description": "Создает удержание 1 места в слоте. Запрос требует уникальный заголовок идемпотентности.",
+                "parameters": [
+                    {
+                        "name": "slot_id",
+                        "in": "path",
+                        "required": true,
+                        "description": "Идентификатор слота",
+                        "schema": {
+                            "type": "integer",
+                            "example": 1
+                        }
+                    },
+                    {
+                        "name": "Idempotency-Key",
+                        "in": "header",
+                        "required": true,
+                        "description": "Уникальный UUID операции для защиты от дублирования запросов",
+                        "schema": {
+                            "type": "string",
+                            "format": "uuid",
+                            "example": "123e4567-e89b-12d3-a456-426614174000"
+                        }
+                    }
+                ],
+                "responses": {
+                    "201": {
+                        "description": "Холд успешно создан либо возвращен из кэша идемпотентности",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/components/schemas/HoldResource"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Бизнес-ошибка: оверсел (нет мест)",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ErrorResponse"
+                                },
+                                "example": {
+                                    "success": false,
+                                    "error_code": "SLOT_OVERSOLD",
+                                    "message": "Все места в слоте заняты."
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Ошибка валидации входных данных",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ValidationErrorResponse"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/slots/{slot_id}/holds/{hold_id}": {
+            "get": {
+                "tags": ["Холды"],
+                "summary": "Получить информацию о холде",
+                "parameters": [
+                    {
+                        "name": "slot_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    },
+                    {
+                        "name": "hold_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Информация о холде",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": { "$ref": "#/components/schemas/HoldResource" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "patch": {
+                "tags": ["Холды"],
+                "summary": "Подтвердить существующий холд",
+                "description": "Переводит холд в статус 'confirmed'. Защищено оптимистичной блокировкой против гонки статусов.",
+                "parameters": [
+                    {
+                        "name": "slot_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    },
+                    {
+                        "name": "hold_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Холд успешно подтвержден",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": { "$ref": "#/components/schemas/HoldResource" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Бизнес-ошибка подтверждения (холд уже отменен)",
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                                "example": {
+                                    "success": false,
+                                    "error_code": "HOLD_NOT_FOUND_CONFIRM",
+                                    "message": "Невозможно подтвердить текущий холд"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "tags": ["Холды"],
+                "summary": "Отменить существующий холд",
+                "description": "Переводит холд в статус 'cancelled', делает soft-delete записи и возвращает место в слот.",
+                "parameters": [
+                    {
+                        "name": "slot_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    },
+                    {
+                        "name": "hold_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": { "type": "integer" }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Холд успешно отменен",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": { "$ref": "#/components/schemas/HoldResource" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Бизнес-ошибка отмены (холд уже подтвержден)",
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+                                "example": {
+                                    "success": false,
+                                    "error_code": "HOLD_NOT_FOUND_CANCEL",
+                                    "message": "This hold cannot be cancelled because it is already confirmed."
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "SlotResource": {
+                "type": "object",
+                "properties": {
+                    "slot_id": { "type": "integer", "example": 1 },
+                    "capacity": { "type": "integer", "example": 100 },
+                    "remaining": { "type": "integer", "example": 99 }
+                }
+            },
+            "HoldResource": {
+                "type": "object",
+                "properties": {
+                    "hold_id": { "type": "integer", "example": 1000 },
+                    "slot_id": { "type": "integer", "example": 1 },
+                    "status": { "type": "string", "enum": ["held", "confirmed", "cancelled"], "example": "held" }
+                }
+            },
+            "ErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "success": { "type": "boolean", "example": false },
+                    "error_code": { "type": "string", "example": "SLOT_OVERSOLD" },
+                    "message": { "type": "string", "example": "Все места в слоте заняты." }
+                }
+            },
+            "ValidationErrorResponse": {
+                "type": "object",
+                "properties": {
+                    "success": { "type": "boolean", "example": false },
+                    "error_code": { "type": "string", "example": "VALIDATE_ERROR" },
+                    "message": { "type": "string", "example": "Ошибка валидаторов" },
+                    "validation_errors": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "example": {
+                            "idempotencyKey": ["The idempotency key field is required."]
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
